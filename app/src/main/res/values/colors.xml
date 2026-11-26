@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="studio_bg">#FF090B10</color>
+    <color name="studio_surface">#FF121621</color>
+    <color name="studio_surface_2">#FF1A2030</color>
+    <color name="studio_accent">#FF6C7CFF</color>
+    <color name="studio_cyan">#FF22D3EE</color>
+    <color name="studio_success">#FF22C55E</color>
+    <color name="studio_warn">#FFF59E0B</color>
+    <color name="studio_danger">#FFEF4444</color>
+</resources>
