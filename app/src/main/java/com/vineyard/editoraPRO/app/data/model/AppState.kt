@@ -74,6 +74,7 @@ data class AppState(
     val includeAudioTrack: Boolean = true,
     val autoVisualQa: Boolean = false,
     val extraNotes: String = "",
+    val externalScriptInput: String = "",
     val stage2Monitor: ProcessMonitorState = ProcessMonitorState(),
 
     // Step 3: Output Preview, QA & Export
