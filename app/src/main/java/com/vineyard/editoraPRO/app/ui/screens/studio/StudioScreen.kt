@@ -69,6 +69,12 @@ fun StudioScreen(
     onSaveToGallery: () -> Unit,
     onNavigateToSettings: () -> Unit,
     onSelectStep2SubStep: (Int) -> Unit = {},
+    onSortUserClipsByName: () -> Unit = {},
+    onMoveUserClip: (Int, Int) -> Unit = { _, _ -> },
+    onBuildExternalPrompt: () -> String = { "" },
+    onExternalScriptChanged: (String) -> Unit = {},
+    onRunExternalScript: (String) -> Unit = {},
+    onShowToast: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -108,7 +114,13 @@ fun StudioScreen(
                 onPreviousStep = { onSelectWizardStep(1) },
                 onNextStep = { onSelectWizardStep(3) },
                 onNavigateToSettings = onNavigateToSettings,
-                onSelectStep2SubStep = onSelectStep2SubStep
+                onSelectStep2SubStep = onSelectStep2SubStep,
+                onSortUserClipsByName = onSortUserClipsByName,
+                onMoveUserClip = onMoveUserClip,
+                onBuildExternalPrompt = onBuildExternalPrompt,
+                onExternalScriptChanged = onExternalScriptChanged,
+                onRunExternalScript = onRunExternalScript,
+                onShowToast = onShowToast
             )
             else -> Step3ExportPane(
                 state = state,
