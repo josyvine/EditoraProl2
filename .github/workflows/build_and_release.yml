@@ -1,0 +1,148 @@
+name: Build Android APK & Play Store AAB
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'ndk;28.0.12433566'
+          accept-android-sdk-licenses: true
+
+      - name: Ensure 5 Segmentation & Detection ML Assets
+        shell: bash
+        run: |
+          ASSETS_DIR="app/src/main/assets"
+          mkdir -p "$ASSETS_DIR"
+          fetch_if_missing() {
+            local file="$ASSETS_DIR/$1"
+            local url="$2"
+            if [ ! -s "$file" ] || [ "$(wc -c < "$file")" -lt 102400 ]; then
+              echo "Downloading $1..."
+              curl -fsSL --retry 3 "$url" -o "$file"
+            fi
+          }
+          fetch_if_missing "deeplab_v3.tflite" "https://storage.googleapis.com/mediapipe-models/image_segmenter/deeplab_v3/float32/1/deeplab_v3.tflite"
+          fetch_if_missing "selfie_multiclass_256x256.tflite" "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite"
+          fetch_if_missing "efficientdet_lite0.tflite" "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/int8/1/efficientdet_lite0.tflite"
+          fetch_if_missing "edge_sam_3x_encoder.onnx" "https://huggingface.co/chongzhou/EdgeSAM/resolve/main/edge_sam_3x_encoder.onnx"
+          fetch_if_missing "edge_sam_3x_decoder.onnx" "https://huggingface.co/chongzhou/EdgeSAM/resolve/main/edge_sam_3x_decoder.onnx"
+          ls -lh "$ASSETS_DIR"
+
+      - name: Decode Keystore
+        id: keystore
+        run: |
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > ${{ github.workspace }}/my-upload-key.jks
+            echo "has_signing=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_signing=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build Release APK & Play Store AAB
+        uses: gradle/gradle-build-action@v3
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/my-upload-key.jks
+          KEYSTORE_FILE: ${{ github.workspace }}/my-upload-key.jks
+          STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        with:
+          gradle-version: '9.3.1'
+          cache-disabled: true
+          arguments: ${{ steps.keystore.outputs.has_signing == 'true' && 'clean app:assembleRelease app:bundleRelease' || 'clean app:assembleDebug' }}
+
+      - name: Verify 16 KB Page Size Alignment in AAB
+        if: steps.keystore.outputs.has_signing == 'true'
+        shell: bash
+        run: |
+          AAB_PATH="app/build/outputs/bundle/release/app-release.aab"
+          if [ ! -f "$AAB_PATH" ]; then
+            echo "❌ AAB file not found at $AAB_PATH"
+            exit 1
+          fi
+
+          SDK_DIR="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          LLVM_OBJDUMP=$(find "$SDK_DIR/ndk" -name "llvm-objdump" | head -n 1)
+          if [ -z "$LLVM_OBJDUMP" ]; then
+            echo "❌ llvm-objdump not found in $SDK_DIR/ndk"
+            exit 1
+          fi
+
+          TMP_DIR=$(mktemp -d)
+          unzip -q "$AAB_PATH" "base/lib/arm64-v8a/*" "base/lib/x86_64/*" -d "$TMP_DIR" || true
+
+          FAILED=0
+          FOUND=0
+          while IFS= read -r -d '' SO; do
+            FOUND=1
+            REL_PATH="${SO#$TMP_DIR/}"
+            echo "Checking: $REL_PATH"
+            ALIGNS=$("$LLVM_OBJDUMP" -p "$SO" | grep "LOAD" | awk '{print $NF}')
+            if [ -z "$ALIGNS" ]; then
+              echo "  ⚠️ No LOAD segments found in $REL_PATH"
+              FAILED=1
+              continue
+            fi
+            for A in $ALIGNS; do
+              echo "  LOAD align: $A"
+              EXP=${A#2\*\*}
+              if ! [[ "$EXP" =~ ^[0-9]+$ ]] || [ "$EXP" -lt 14 ]; then
+                echo "  ❌ UNALIGNED (< 16KB): $REL_PATH ($A)"
+                FAILED=1
+              fi
+            done
+          done < <(find "$TMP_DIR" -name "*.so" -print0)
+
+          rm -rf "$TMP_DIR"
+          if [ "$FOUND" -eq 0 ]; then
+            echo "ℹ️ No 64-bit .so libraries found in AAB."
+            exit 0
+          fi
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "❌ 16 KB page size verification FAILED!"
+            exit 1
+          fi
+          echo "✅ All 64-bit .so libraries in the AAB are 16 KB aligned!"
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: editoraPRO-builds
+          retention-days: 14
+          path: |
+            app/build/outputs/apk/**/*.apk
+            app/build/outputs/bundle/**/*.aab
+
+      - name: Publish GitHub Release on Version Tag
+        if: startsWith(github.ref, 'refs/tags/v') && steps.keystore.outputs.has_signing == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/bundle/release/*.aab
