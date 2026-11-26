@@ -82,6 +82,12 @@ fun Step2MediaPromptPane(
     onNextStep: () -> Unit,
     onNavigateToSettings: () -> Unit,
     onSelectStep2SubStep: (Int) -> Unit = {},
+    onSortUserClipsByName: () -> Unit = {},
+    onMoveUserClip: (Int, Int) -> Unit = { _, _ -> },
+    onBuildExternalPrompt: () -> String = { "" },
+    onExternalScriptChanged: (String) -> Unit = {},
+    onRunExternalScript: (String) -> Unit = {},
+    onShowToast: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val pickMediaLauncher = rememberLauncherForActivityResult(
@@ -150,6 +156,36 @@ fun Step2MediaPromptPane(
                 )
 
                 if (state.userClips.isNotEmpty()) {
+                    if (state.userClips.size > 1) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Clip order (#0 -> #${state.userClips.size - 1})",
+                                color = EditoraTextMuted,
+                                fontSize = 11.sp
+                            )
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = EditoraSurface2,
+                                border = BorderStroke(1.dp, EditoraBorder),
+                                modifier = Modifier
+                                    .testTag("sort_clips_by_name_button")
+                                    .clickable(role = Role.Button) { onSortUserClipsByName() }
+                            ) {
+                                Text(
+                                    text = "Sort A→Z by Name",
+                                    color = EditoraAccentCyan,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                )
+                            }
+                        }
+                    }
+
                     val rows = state.userClips.withIndex().chunked(3)
                     Column(
                         modifier = Modifier
@@ -165,8 +201,11 @@ fun Step2MediaPromptPane(
                                 rowItems.forEach { indexed ->
                                     ClipChipCard(
                                         index = indexed.index,
+                                        totalCount = state.userClips.size,
                                         clip = indexed.value,
                                         onRemove = { onRemoveUserClip(indexed.index) },
+                                        onMoveLeft = { onMoveUserClip(indexed.index, indexed.index - 1) },
+                                        onMoveRight = { onMoveUserClip(indexed.index, indexed.index + 1) },
                                         modifier = Modifier.weight(1f)
                                     )
                                 }
@@ -332,6 +371,17 @@ fun Step2MediaPromptPane(
                 )
             }
 
+            ExternalScriptCard(
+                scriptText = state.externalScriptInput,
+                isBusy = isRunning,
+                hasRefAudio = state.refFile != null,
+                refName = state.refName,
+                onBuildPromptPack = onBuildExternalPrompt,
+                onScriptChanged = onExternalScriptChanged,
+                onRunOffline = { onRunExternalScript(state.externalScriptInput) },
+                onShowToast = onShowToast
+            )
+
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -414,8 +464,11 @@ private fun Step2SubStepBar(
 @Composable
 private fun ClipChipCard(
     index: Int,
+    totalCount: Int,
     clip: ClipAsset,
     onRemove: () -> Unit,
+    onMoveLeft: () -> Unit,
+    onMoveRight: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Surface(
@@ -463,6 +516,40 @@ private fun ClipChipCard(
                         color = EditoraTextMuted,
                         fontSize = 10.sp
                     )
+                }
+                Text(
+                    text = clip.name,
+                    color = EditoraTextMuted,
+                    fontSize = 9.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (totalCount > 1) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "←",
+                            color = if (index > 0) EditoraAccentCyan else EditoraTextMuted.copy(alpha = 0.35f),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(4.dp))
+                                .clickable(enabled = index > 0) { onMoveLeft() }
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                        Text(
+                            text = "→",
+                            color = if (index < totalCount - 1) EditoraAccentCyan else EditoraTextMuted.copy(alpha = 0.35f),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(4.dp))
+                                .clickable(enabled = index < totalCount - 1) { onMoveRight() }
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
                 }
             }
 
