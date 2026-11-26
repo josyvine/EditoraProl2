@@ -27,8 +27,10 @@ import com.vineyard.editoraPRO.app.data.model.ThinkingLevel
 import com.vineyard.editoraPRO.app.data.model.TokenUsageSnapshot
 import com.vineyard.editoraPRO.app.data.model.UsageStage
 import com.vineyard.editoraPRO.app.data.remote.ModelPricingCatalog
+import com.vineyard.editoraPRO.app.domain.engine.ExternalStudioScriptHelper
 import com.vineyard.editoraPRO.app.domain.media.BeatDetector
 import com.vineyard.editoraPRO.app.domain.media.FrameExtractor
+import com.vineyard.editoraPRO.app.domain.media.FramePixelStats
 import com.vineyard.editoraPRO.app.domain.media.InspectionSheetBuilder
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -48,6 +50,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -831,6 +834,28 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun sortUserClipsByName() {
+        _uiState.update { st ->
+            if (st.userClips.size <= 1) st
+            else st.copy(userClips = st.userClips.sortedBy { it.name.lowercase(Locale.US) })
+        }
+        appendLog("Sorted user clips A→Z by filename.")
+        showToast("Clips sorted by name")
+    }
+
+    fun moveUserClip(fromIndex: Int, toIndex: Int) {
+        _uiState.update { st ->
+            if (fromIndex !in st.userClips.indices || toIndex !in st.userClips.indices || fromIndex == toIndex) {
+                st
+            } else {
+                val mutable = st.userClips.toMutableList()
+                val item = mutable.removeAt(fromIndex)
+                mutable.add(toIndex, item)
+                st.copy(userClips = mutable)
+            }
+        }
+    }
+
     fun loadCustomAudio(uri: Uri) {
         viewModelScope.launch {
             try {
@@ -873,6 +898,150 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setExtraNotes(notes: String) {
         _uiState.update { it.copy(extraNotes = notes) }
+    }
+
+    fun setExternalScriptInput(script: String) {
+        _uiState.update { it.copy(externalScriptInput = script) }
+    }
+
+    fun buildExternalAiStudioPrompt(): String {
+        val cur = _uiState.value
+        val pack = ExternalStudioScriptHelper.buildAiStudioWebPack(
+            userPrompt = cur.extraNotes.trim(),
+            clips = cur.userClips,
+            refLoadedInApp = cur.refFile != null,
+            refName = cur.refName,
+            refDurationSec = cur.refDurationSec,
+            refWidth = cur.refWidth,
+            refHeight = cur.refHeight,
+            refBeats = cur.refBeats,
+            refSceneCuts = cur.refSceneCuts,
+            customAudioName = cur.customAudioName,
+            customAudioDurationSec = cur.customAudioDurationSec,
+            customAudioBeats = cur.customAudioBeats
+        )
+        appendLog("Built AI Studio Web Prompt Pack (${cur.userClips.size} aligned clip(s), refAudio=${cur.refFile != null}).")
+        return pack
+    }
+
+    fun runImportedScript(rawScript: String) {
+        val trimmed = rawScript.trim()
+        if (trimmed.isEmpty()) {
+            showToast("Paste or upload an edit script first.")
+            return
+        }
+
+        stopPlayback()
+        activeStageJob?.cancel()
+        val tracker = TelemetryStreamTracker(
+            onMonitorUpdate = { m -> _uiState.update { it.copy(stage2Monitor = m) } },
+            onLiveStreamUpdate = { txt, status -> _uiState.update { it.copy(liveStreamText = txt, streamMonitorStatus = status) } },
+            onLog = { appendLog(it) }
+        )
+
+        activeStageJob = viewModelScope.launch {
+            tracker.start(this, "Compiling imported script offline (No API)...")
+            syncCrashCheckpoint("Stage 2: Offline Script Import", inProgress = true, forceFlush = true)
+            try {
+                val cur = _uiState.value
+                val parsed = ExternalStudioScriptHelper.parseExternalScript(trimmed, geminiClient)
+                val planJson = parsed.plan
+                val firstClip = cur.userClips.firstOrNull()
+
+                val fallbackW = cur.refAnalysis?.meta?.aspectWidth?.takeIf { it > 0 }
+                    ?: cur.refWidth.takeIf { it > 0 }
+                    ?: firstClip?.width?.takeIf { it > 0 }
+                    ?: 9
+                val fallbackH = cur.refAnalysis?.meta?.aspectHeight?.takeIf { it > 0 }
+                    ?: cur.refHeight.takeIf { it > 0 }
+                    ?: firstClip?.height?.takeIf { it > 0 }
+                    ?: 16
+                val aw = if (planJson.aspectWidth > 0) planJson.aspectWidth else fallbackW
+                val ah = if (planJson.aspectHeight > 0) planJson.aspectHeight else fallbackH
+                val (canvasW, canvasH) = computeCanvasSize(aw, ah, cur.maxCanvasEdge)
+
+                val durationSec = max(
+                    1f,
+                    when {
+                        planJson.totalDurationSec > 0.2 -> planJson.totalDurationSec.toFloat()
+                        cur.refDurationSec > 0.2f -> cur.refDurationSec
+                        cur.customAudioDurationSec > 0.2f -> cur.customAudioDurationSec
+                        firstClip != null && !firstClip.isImage && firstClip.durationSec > 0.2f -> firstClip.durationSec
+                        else -> 10f
+                    }
+                )
+
+                _uiState.update {
+                    it.copy(
+                        canvasWidth = canvasW,
+                        canvasHeight = canvasH,
+                        totalDurationSec = durationSec,
+                        editPlan = planJson.editPlan,
+                        blueprintJsonText = prettyJson.encodeToString(planJson),
+                        pipelineCodeText = parsed.code,
+                        liveStreamText = trimmed
+                    )
+                }
+                syncCrashCheckpoint("Stage 2: Offline Validate (${canvasW}x${canvasH})", inProgress = true, forceFlush = true)
+                tracker.setStatus("Initializing QuickJS & validating frames...", 0.5f)
+
+                services.quickJsRunner.compileAndInitPipeline(
+                    pipelineCode = parsed.code,
+                    toolsCode = cur.toolsCode,
+                    clips = cur.userClips,
+                    editPlan = planJson.editPlan
+                )
+
+                val probeTimes = services.quickJsRunner.buildValidationProbeTimes(durationSec, planJson.editPlan)
+                var visibleFrames = 0
+                var flatDetail = ""
+                for ((idx, tt) in probeTimes.withIndex()) {
+                    val bmp = services.quickJsRunner.renderFrame(canvasW, canvasH, tt, durationSec)
+                    val stats: FramePixelStats = FrameExtractor.measureFrameStats(bmp)
+                    val hasPixels = stats.nonBlackPct >= 1 && stats.flatPct < 96
+                    if (hasPixels) visibleFrames++
+                    else if (stats.flatPct >= 96) {
+                        flatDetail = "flat single-color screen (${stats.flatPct}% uniform RGB ~ [${stats.avgR},${stats.avgG},${stats.avgB}]) at t=${"%.2f".format(tt)}s"
+                    }
+                    tracker.setStatus("Validated ${idx + 1}/${probeTimes.size} frames...", 0.55f + 0.35f * ((idx + 1f) / probeTimes.size))
+                    appendLog("Offline validation t=${"%.2f".format(tt)}s (visibleContent=$hasPixels, nonBlack=${stats.nonBlackPct}%, flat=${stats.flatPct}%)")
+                }
+
+                if (visibleFrames < max(2, ceil(probeTimes.size * 0.5).toInt())) {
+                    throw IllegalStateException(
+                        if (flatDetail.isNotEmpty()) {
+                            "Offline validation: rendered output was a $flatDetail across test timestamps."
+                        } else {
+                            "Offline validation: rendered output was black/blank across test timestamps."
+                        }
+                    )
+                }
+
+                val previewStart = min(durationSec * 0.5f, 2.0f)
+                _uiState.update {
+                    it.copy(
+                        isRenderReady = true,
+                        totalDurationSec = durationSec,
+                        currentTimeSec = previewStart,
+                        step2Done = true
+                    )
+                }
+                drawFrameAtTime(previewStart)
+                tracker.finish("Offline script ready! Tap Next: Render → to preview & export.", true)
+                appendLog("Offline script ready (${canvasW}x${canvasH}, ${"%.2f".format(durationSec)}s, refAudio=${refAudioBuffer != null}, customAudio=${customAudioBuffer != null}).")
+                showToast("Offline script ready (No API)!")
+            } catch (e: CancellationException) {
+                tracker.finish("Cancelled by user.", success = false)
+                appendLog("Offline script execution cancelled.")
+            } catch (err: Throwable) {
+                val msg = err.message ?: "Offline script error"
+                tracker.finish(msg, success = false)
+                appendLog("Offline script error: $msg")
+                showToast("Script error: $msg")
+            } finally {
+                syncCrashCheckpoint("Idle", inProgress = false, forceFlush = true)
+            }
+        }
     }
 
     fun buildEdit() {
