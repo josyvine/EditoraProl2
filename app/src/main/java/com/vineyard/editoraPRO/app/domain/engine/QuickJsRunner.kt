@@ -21,6 +21,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -59,12 +61,14 @@ class QuickJsRunner(
         Thread(r, "Editora-QuickJS").apply { isDaemon = true }
     }
     private val jsDispatcher = jsExecutor.asCoroutineDispatcher()
+    private val renderMutex = Mutex()
 
     private val c2d = Canvas2dHost()
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
     private var qjs: QuickJs? = null
     private var clipsList: List<ClipAsset> = emptyList()
+    private var lastClipSignatures: List<String> = emptyList()
     private val imageCache = ConcurrentHashMap<Int, Bitmap>()
     private val retrieverCache = ConcurrentHashMap<Int, MediaMetadataRetriever>()
     private val clipSeekTimes = ConcurrentHashMap<Int, Float>()
@@ -74,12 +78,24 @@ class QuickJsRunner(
     private val asyncEvalSeq = AtomicInteger(1)
     private val frameCutoutSeq = AtomicInteger(0)
     private val initCutoutSeq = AtomicInteger(0)
+
     @Volatile
     private var isRenderingFrame: Boolean = false
 
     @Volatile
+    private var decodeMaxEdge: Int = 1080
+
+    @Volatile
     var aiGeneratedAudioBuffer: PcmAudioBuffer? = null
         private set
+
+    fun setDecodeMaxEdge(maxEdge: Int) {
+        decodeMaxEdge = maxEdge.coerceIn(320, 1920)
+    }
+
+    fun clearVisionCaches() {
+        smartSegmenter.clearCaches()
+    }
 
     private suspend fun ensureQuickJsReady(): QuickJs = withContext(jsDispatcher) {
         qjs?.let { return@withContext it }
@@ -369,7 +385,6 @@ class QuickJsRunner(
                 if (clipIdx != null) {
                     getFrame(clipIdx, t)
                 } else {
-                    // Already a canvas handle
                     handle
                 }
             }
@@ -447,29 +462,36 @@ class QuickJsRunner(
                 )
             }
             deferred.await()
+        } catch (ce: CancellationException) {
+            deferred.cancel()
+            throw ce
         } finally {
             pendingAsyncEvals.remove(id)
         }
     }
 
-    suspend fun compileTools(toolsCode: String): List<String> = withContext(jsDispatcher) {
-        val engine = ensureQuickJsReady()
-        val cleaned = toolsCode.ifBlank { "const tools = {};" }
-        engine.evaluate<List<String>>(
-            """
-            (function() {
-              $cleaned
-              globalThis.__stage1Tools = typeof tools !== "undefined" ? tools : {};
-              return Object.keys(globalThis.__stage1Tools);
-            })();
-            """.trimIndent()
-        ) ?: emptyList()
+    suspend fun compileTools(toolsCode: String): List<String> = renderMutex.withLock {
+        withContext(jsDispatcher) {
+            val engine = ensureQuickJsReady()
+            val cleaned = toolsCode.ifBlank { "const tools = {};" }
+            engine.evaluate<List<String>>(
+                """
+                (function() {
+                  $cleaned
+                  globalThis.__stage1Tools = typeof tools !== "undefined" ? tools : {};
+                  return Object.keys(globalThis.__stage1Tools);
+                })();
+                """.trimIndent()
+            ) ?: emptyList()
+        }
     }
 
-    suspend fun setEditPlan(editPlan: List<EditPlanSegment>) = withContext(jsDispatcher) {
-        val engine = ensureQuickJsReady()
-        val planJson = json.encodeToString(editPlan)
-        engine.evaluate<Any?>("globalThis.__activeEditPlan = $planJson;")
+    suspend fun setEditPlan(editPlan: List<EditPlanSegment>) = renderMutex.withLock {
+        withContext(jsDispatcher) {
+            val engine = ensureQuickJsReady()
+            val planJson = json.encodeToString(editPlan)
+            engine.evaluate<Any?>("globalThis.__activeEditPlan = $planJson;")
+        }
     }
 
     suspend fun compileAndInitPipeline(
@@ -477,7 +499,7 @@ class QuickJsRunner(
         toolsCode: String,
         clips: List<ClipAsset>,
         editPlan: List<EditPlanSegment>
-    ) {
+    ) = renderMutex.withLock {
         val engine = withContext(jsDispatcher) {
             isRenderingFrame = false
             initCutoutSeq.set(0)
@@ -557,7 +579,7 @@ class QuickJsRunner(
         )
     }
 
-    suspend fun renderFrame(width: Int, height: Int, tSec: Float, durationSec: Float): Bitmap {
+    suspend fun renderFrame(width: Int, height: Int, tSec: Float, durationSec: Float): Bitmap = renderMutex.withLock {
         val w = width.coerceAtLeast(2)
         val h = height.coerceAtLeast(2)
         val engine = withContext(jsDispatcher) {
@@ -642,7 +664,7 @@ class QuickJsRunner(
             isRenderingFrame = false
         }
 
-        return withContext(jsDispatcher) {
+        withContext(jsDispatcher) {
             c2d.getBitmap("__buf_main") ?: Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         }
     }
@@ -787,6 +809,11 @@ class QuickJsRunner(
     }
 
     private fun updateClips(clips: List<ClipAsset>) {
+        val newSigs = clips.map { "${it.localFile.absolutePath}:${it.localFile.lastModified()}:${it.durationSec}" }
+        if (newSigs != lastClipSignatures) {
+            smartSegmenter.clearCaches()
+            lastClipSignatures = newSigs
+        }
         clipsList = clips
         retrieverCache.values.forEach { runCatching { it.release() } }
         retrieverCache.clear()
@@ -800,6 +827,7 @@ class QuickJsRunner(
         val parts = raw.removePrefix("__frame_").split("_")
         if (parts.size != 2) return null
         val clipIdx = parts[0].toIntOrNull() ?: return null
+        if (parts[1] == "img") return clipIdx to 0f
         val qTick = parts[1].toIntOrNull() ?: return null
         return clipIdx to (qTick / 24f)
     }
@@ -847,23 +875,30 @@ class QuickJsRunner(
         } else {
             clipIdx = parseClipIndex(raw) ?: return null
             t = clipSeekTimes[clipIdx] ?: 0f
-            val qTick = (t * 24f).roundToInt()
-            key = "__frame_${clipIdx}_$qTick"
+            val isImg = clipsList.getOrNull(clipIdx)?.isImage == true
+            key = if (isImg) "__frame_${clipIdx}_img" else "__frame_${clipIdx}_${(t * 24f).roundToInt()}"
         }
         synchronized(frameRingLock) {
             if (c2d.getBitmap(key)?.let { !it.isRecycled } == true) return key
         }
         val bmp = extractClipBitmapSync(clipIdx, t) ?: return null
-        val copy = if (!bmp.isRecycled) bmp.copy(Bitmap.Config.ARGB_8888, true) else null
-        if (clipsList.getOrNull(clipIdx)?.isImage != true && !bmp.isRecycled) {
-            bmp.recycle()
-        }
-        if (copy == null) return null
+        val isImg = clipsList.getOrNull(clipIdx)?.isImage == true
+        val copy = if (isImg) {
+            bmp.copy(Bitmap.Config.ARGB_8888, true)
+        } else if (bmp.isMutable && bmp.config == Bitmap.Config.ARGB_8888) {
+            bmp
+        } else {
+            val c = bmp.copy(Bitmap.Config.ARGB_8888, true)
+            if (!bmp.isRecycled) bmp.recycle()
+            c
+        } ?: return null
+
         synchronized(frameRingLock) {
             c2d.putBitmapAsSurface(key, copy)
             frameRingKeys.remove(key)
             frameRingKeys.addLast(key)
-            while (frameRingKeys.size > 18) {
+            val limit = if (decodeMaxEdge <= 720) 24 else 18
+            while (frameRingKeys.size > limit) {
                 val oldKey = frameRingKeys.removeFirst()
                 if (oldKey != key) {
                     c2d.removeSurface(oldKey)
@@ -875,6 +910,7 @@ class QuickJsRunner(
 
     private fun extractClipBitmapSync(clipIndex: Int, timeSec: Float): Bitmap? {
         val clip = clipsList.getOrNull(clipIndex) ?: return null
+        val maxEdge = decodeMaxEdge
         if (clip.isImage) {
             imageCache[clipIndex]?.takeIf { !it.isRecycled }?.let { return it }
             val decoded = runCatching {
@@ -887,13 +923,15 @@ class QuickJsRunner(
         val retriever = retrieverCache.getOrPut(clipIndex) {
             MediaMetadataRetriever().apply { setDataSource(clip.localFile.absolutePath) }
         }
-        return FrameExtractor.extractVideoFrame(
-            retriever = retriever,
-            durationSec = clip.durationSec,
-            timeSec = timeSec,
-            maxEdge = 1080,
-            exact = true
-        )
+        return synchronized(retriever) {
+            FrameExtractor.extractVideoFrame(
+                retriever = retriever,
+                durationSec = clip.durationSec,
+                timeSec = timeSec,
+                maxEdge = maxEdge,
+                exact = true
+            )
+        }
     }
 
     // ---- NativeRuntimeApi implementations ----
@@ -910,8 +948,13 @@ class QuickJsRunner(
 
     override suspend fun getFrame(clipIndex: Int, timeSec: Float): String = withContext(Dispatchers.Default) {
         clipSeekTimes[clipIndex] = timeSec
-        val qTick = (timeSec * 24f).roundToInt()
-        val ringKey = "__frame_${clipIndex}_$qTick"
+        val isImg = clipsList.getOrNull(clipIndex)?.isImage == true
+        val ringKey = if (isImg) {
+            "__frame_${clipIndex}_img"
+        } else {
+            val qTick = (timeSec * 24f).roundToInt()
+            "__frame_${clipIndex}_$qTick"
+        }
         synchronized(frameRingLock) {
             if (c2d.getBitmap(ringKey)?.let { !it.isRecycled } == true) {
                 return@withContext ringKey
@@ -919,19 +962,23 @@ class QuickJsRunner(
         }
         val bmp = extractClipBitmapSync(clipIndex, timeSec)
             ?: Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
-        val copy = if (!bmp.isRecycled) {
+        val copy = if (isImg) {
             bmp.copy(Bitmap.Config.ARGB_8888, true) ?: Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
+        } else if (bmp.isMutable && bmp.config == Bitmap.Config.ARGB_8888 && !bmp.isRecycled) {
+            bmp
+        } else if (!bmp.isRecycled) {
+            val c = bmp.copy(Bitmap.Config.ARGB_8888, true)
+            bmp.recycle()
+            c ?: Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
         } else {
             Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
-        }
-        if (clipsList.getOrNull(clipIndex)?.isImage != true && !bmp.isRecycled) {
-            bmp.recycle()
         }
         synchronized(frameRingLock) {
             c2d.putBitmapAsSurface(ringKey, copy)
             frameRingKeys.remove(ringKey)
             frameRingKeys.addLast(ringKey)
-            while (frameRingKeys.size > 18) {
+            val limit = if (decodeMaxEdge <= 720) 24 else 18
+            while (frameRingKeys.size > limit) {
                 val oldKey = frameRingKeys.removeFirst()
                 if (oldKey != ringKey) {
                     c2d.removeSurface(oldKey)
