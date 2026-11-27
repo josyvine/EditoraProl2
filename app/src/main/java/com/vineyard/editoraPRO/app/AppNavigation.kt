@@ -160,7 +160,13 @@ fun AppNavigation(
                                 onExportVideo = viewModel::exportVideo,
                                 onSaveToGallery = viewModel::saveExportedToGallery,
                                 onNavigateToSettings = { viewModel.setActiveTab(MainTab.SETTINGS) },
-                                onSelectStep2SubStep = viewModel::setStep2SubStep
+                                onSelectStep2SubStep = viewModel::setStep2SubStep,
+                                onBuildPreviewProxy = viewModel::buildPreviewProxy,
+                                onCancelPreviewProxy = viewModel::cancelPreviewProxyBuild,
+                                onCancelExport = viewModel::cancelExport,
+                                onToggleUseProxyPlayer = viewModel::setUseVideoProxyPlayer,
+                                onExoPositionChanged = viewModel::onExoPositionChanged,
+                                onExoPlayingChanged = viewModel::onExoPlayingChanged
                             )
                             MainTab.AI_LOGIC -> AiLogicScreen(
                                 state = state,
