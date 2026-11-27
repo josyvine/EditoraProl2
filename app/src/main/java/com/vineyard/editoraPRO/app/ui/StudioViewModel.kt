@@ -28,6 +28,7 @@ import com.vineyard.editoraPRO.app.data.model.TokenUsageSnapshot
 import com.vineyard.editoraPRO.app.data.model.UsageStage
 import com.vineyard.editoraPRO.app.data.remote.ModelPricingCatalog
 import com.vineyard.editoraPRO.app.domain.engine.ExternalStudioScriptHelper
+import com.vineyard.editoraPRO.app.domain.export.PreviewProxyRenderer
 import com.vineyard.editoraPRO.app.domain.media.BeatDetector
 import com.vineyard.editoraPRO.app.domain.media.FrameExtractor
 import com.vineyard.editoraPRO.app.domain.media.FramePixelStats
@@ -66,6 +67,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private val prettyJson = Json { prettyPrint = true; encodeDefaults = true; ignoreUnknownKeys = true }
 
     private val services = StudioServiceContainer(app) { msg -> appendLog(msg) }
+    private val previewProxyRenderer = PreviewProxyRenderer(app, services.videoExporter)
     private val audioPlayer = AudioPreviewPlayer()
     private val drawMutex = Mutex()
 
@@ -82,6 +84,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private var customAudioBuffer: PcmAudioBuffer? = null
     private var activeStageJob: Job? = null
     private var playbackJob: Job? = null
+    private var previewProxyJob: Job? = null
+    private var exportJob: Job? = null
 
     private fun createInitialState(): AppState {
         val provider = prefs.getProviderMode()
@@ -822,12 +826,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 }
             }
             if (newClips.isNotEmpty()) {
+                services.quickJsRunner.clearVisionCaches()
                 _uiState.update { it.copy(userClips = it.userClips + newClips) }
             }
         }
     }
 
     fun removeUserClip(index: Int) {
+        services.quickJsRunner.clearVisionCaches()
         _uiState.update { st ->
             if (index !in st.userClips.indices) st
             else st.copy(userClips = st.userClips.toMutableList().apply { removeAt(index) })
@@ -932,6 +938,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         stopPlayback()
+        cancelPreviewProxyBuild()
+        cancelExport()
         activeStageJob?.cancel()
         val tracker = TelemetryStreamTracker(
             onMonitorUpdate = { m -> _uiState.update { it.copy(stage2Monitor = m) } },
@@ -1017,6 +1025,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     )
                 }
 
+                invalidateRenderedVideoCaches()
                 val previewStart = min(durationSec * 0.5f, 2.0f)
                 _uiState.update {
                     it.copy(
@@ -1059,6 +1068,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         stopPlayback()
+        cancelPreviewProxyBuild()
+        cancelExport()
         activeStageJob?.cancel()
         val tracker = TelemetryStreamTracker(
             onMonitorUpdate = { m -> _uiState.update { it.copy(stage2Monitor = m) } },
@@ -1344,6 +1355,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     }
                 }
 
+                invalidateRenderedVideoCaches()
                 val previewStart = min(durationSec * 0.5f, 2.0f)
                 _uiState.update {
                     it.copy(
@@ -1378,16 +1390,74 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    // ---- Step 3: Playback, Scrubbing, Manual Auto-Fix & Hardware Export ----
+    // ---- Step 3: Playback, Proxy Cache, Scrubbing, Manual Auto-Fix & Hardware Export ----
+
+    private fun invalidateRenderedVideoCaches() {
+        previewProxyRenderer.clearProxyFiles()
+        _uiState.update {
+            it.copy(
+                previewProxyFile = null,
+                isBuildingPreviewProxy = false,
+                previewProxyProgress = 0f,
+                previewProxyStatusText = "",
+                exportedVideoFile = null,
+                exportedVideoUri = null,
+                cachedRenderedMp4File = null,
+                exportFrameText = "",
+                exportEtaText = "",
+                isFastDownloadSaving = false
+            )
+        }
+    }
+
+    private fun activePlayableVideoFile(st: AppState): File? {
+        if (!st.useVideoProxyPlayer) return null
+        val full = st.exportedVideoFile ?: st.cachedRenderedMp4File
+        if (full != null && full.exists() && full.length() > 1024L) return full
+        val proxy = st.previewProxyFile
+        if (proxy != null && proxy.exists() && proxy.length() > 1024L) return proxy
+        return null
+    }
+
+    fun setUseVideoProxyPlayer(enabled: Boolean) {
+        if (_uiState.value.isPlaying) stopPlayback()
+        _uiState.update { it.copy(useVideoProxyPlayer = enabled) }
+    }
+
+    fun onExoPositionChanged(posSec: Float) {
+        val dur = _uiState.value.totalDurationSec
+        val clamped = posSec.coerceIn(0f, dur)
+        _uiState.update { st ->
+            if (st.isPlaying) st.copy(currentTimeSec = clamped) else st
+        }
+    }
+
+    fun onExoPlayingChanged(playing: Boolean) {
+        _uiState.update { st ->
+            if (st.isPlaying != playing) st.copy(isPlaying = playing) else st
+        }
+    }
 
     fun setQaFeedbackInput(text: String) {
         _uiState.update { it.copy(qaFeedbackInput = text) }
     }
 
     fun seekTo(timeSec: Float) {
-        if (!_uiState.value.isRenderReady) return
-        if (_uiState.value.isPlaying) stopPlayback()
-        val clamped = timeSec.coerceIn(0f, _uiState.value.totalDurationSec)
+        val st = _uiState.value
+        if (!st.isRenderReady) return
+        val clamped = timeSec.coerceIn(0f, st.totalDurationSec)
+        val playableMp4 = activePlayableVideoFile(st)
+        if (playableMp4 != null) {
+            if (st.isPlaying) _uiState.update { it.copy(isPlaying = false) }
+            _uiState.update { it.copy(currentTimeSec = clamped) }
+            return
+        }
+
+        if (st.isExporting || st.isBuildingPreviewProxy) {
+            showToast("Wait for current render/export to finish or tap Cancel.")
+            return
+        }
+        if (st.isPlaying) stopPlayback()
         _uiState.update { it.copy(currentTimeSec = clamped) }
         viewModelScope.launch { drawFrameAtTime(clamped) }
     }
@@ -1395,6 +1465,23 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun togglePlayPause() {
         val st = _uiState.value
         if (!st.isRenderReady) return
+
+        val playableMp4 = activePlayableVideoFile(st)
+        if (playableMp4 != null) {
+            if (st.isPlaying) {
+                _uiState.update { it.copy(isPlaying = false) }
+            } else {
+                val startT = if (st.currentTimeSec >= st.totalDurationSec - 0.08f) 0f else st.currentTimeSec
+                _uiState.update { it.copy(isPlaying = true, currentTimeSec = startT) }
+            }
+            return
+        }
+
+        if (st.isExporting || st.isBuildingPreviewProxy) {
+            showToast("Render/Export is running — wait for completion or cancel first.")
+            return
+        }
+
         if (st.isPlaying) {
             stopPlayback()
             return
@@ -1438,7 +1525,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     private suspend fun drawFrameAtTime(t: Float) {
         val st = _uiState.value
-        if (!st.isRenderReady) return
+        if (!st.isRenderReady || st.isExporting || st.isBuildingPreviewProxy) return
         drawMutex.withLock {
             runCatching {
                 val raw = services.quickJsRunner.renderFrame(st.canvasWidth, st.canvasHeight, t, st.totalDurationSec)
@@ -1447,9 +1534,100 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     cur.copy(previewFrame = copy)
                 }
             }.onFailure { err ->
-                appendLog("Render tick error at t=${"%.2f".format(t)}s: ${err.message}")
+                if (err !is CancellationException) {
+                    appendLog("Render tick error at t=${"%.2f".format(t)}s: ${err.message}")
+                }
             }
         }
+    }
+
+    fun buildPreviewProxy() {
+        val st = _uiState.value
+        if (!st.isRenderReady || st.isBuildingPreviewProxy) return
+        if (st.isExporting) {
+            showToast("Export is already running — smooth playback will be ready right after.")
+            return
+        }
+        stopPlayback()
+        previewProxyJob?.cancel()
+
+        previewProxyJob = viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    isBuildingPreviewProxy = true,
+                    previewProxyProgress = 0.02f,
+                    previewProxyStatusText = "Preparing fast playable preview proxy...",
+                    exportFrameText = "",
+                    exportEtaText = "Calculating..."
+                )
+            }
+            syncCrashCheckpoint("Stage 3: Fast Preview Proxy", inProgress = true, forceFlush = true)
+            try {
+                val activeAudio = getActiveAudioBuffer()
+                appendLog("Building fast playable preview proxy (480px @ 15fps, audio=${activeAudio != null})...")
+                val proxyFile = previewProxyRenderer.buildPreviewProxy(
+                    quickJsRunner = services.quickJsRunner,
+                    canvasWidth = st.canvasWidth,
+                    canvasHeight = st.canvasHeight,
+                    durationSec = st.totalDurationSec,
+                    audioBuffer = activeAudio,
+                    onProgress = { prog, msg ->
+                        _uiState.update { it.copy(previewProxyProgress = prog, previewProxyStatusText = msg) }
+                    },
+                    onFrameProgress = { done, total, etaSec ->
+                        _uiState.update {
+                            it.copy(
+                                exportFrameText = "Proxy Frame $done / $total",
+                                exportEtaText = formatEtaText(etaSec)
+                            )
+                        }
+                    }
+                )
+                _uiState.update {
+                    it.copy(
+                        isBuildingPreviewProxy = false,
+                        previewProxyProgress = 1f,
+                        previewProxyStatusText = "Smooth preview proxy ready!",
+                        previewProxyFile = proxyFile,
+                        useVideoProxyPlayer = true,
+                        currentTimeSec = 0f,
+                        exportFrameText = "",
+                        exportEtaText = ""
+                    )
+                }
+                appendLog("Smooth preview proxy ready (${"%.2f".format(proxyFile.length() / (1024.0 * 1024.0))} MB).")
+                showToast("Smooth preview ready! Tap Play Preview.")
+            } catch (ce: CancellationException) {
+                _uiState.update {
+                    it.copy(
+                        isBuildingPreviewProxy = false,
+                        previewProxyProgress = 0f,
+                        previewProxyStatusText = "Preview build cancelled.",
+                        exportFrameText = "",
+                        exportEtaText = ""
+                    )
+                }
+                appendLog("Preview proxy build cancelled by user.")
+            } catch (err: Throwable) {
+                _uiState.update {
+                    it.copy(
+                        isBuildingPreviewProxy = false,
+                        previewProxyStatusText = "Preview proxy error: ${err.message}",
+                        exportFrameText = "",
+                        exportEtaText = ""
+                    )
+                }
+                appendLog("Preview proxy error: ${err.message}")
+                showToast("Preview cache failed: ${err.message}")
+            } finally {
+                syncCrashCheckpoint("Idle", inProgress = false, forceFlush = true)
+            }
+        }
+    }
+
+    fun cancelPreviewProxyBuild() {
+        previewProxyJob?.cancel()
+        previewProxyJob = null
     }
 
     fun runManualAutoFix() {
@@ -1458,7 +1636,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             showToast("Generate an edit first.")
             return
         }
-        if (st.isPlaying) stopPlayback()
+        stopPlayback()
+        cancelPreviewProxyBuild()
+        cancelExport()
 
         activeStageJob?.cancel()
         val tracker = TelemetryStreamTracker(
@@ -1531,11 +1711,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     onUsage = { stage, u, partial -> recordTokenUsage(stage, u, partial) }
                 )
 
+                if (outcome.changed) {
+                    invalidateRenderedVideoCaches()
+                    _uiState.update { it.copy(qaFeedbackInput = "") }
+                }
                 val safeT = min(max(0.05f, outcome.finalDurationSec - 0.05f), max(0.5f, cur.currentTimeSec))
                 drawFrameAtTime(safeT)
 
                 if (outcome.changed) {
-                    _uiState.update { it.copy(qaFeedbackInput = "") }
                     tracker.finish("Auto-Fix updated code & preview!", true)
                     showToast("AI Auto-Fix updated code & preview!")
                 } else {
@@ -1559,14 +1742,19 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun exportVideo() {
         val st = _uiState.value
         if (!st.isRenderReady || st.isExporting) return
-        if (st.isPlaying) stopPlayback()
+        stopPlayback()
+        cancelPreviewProxyBuild()
+        exportJob?.cancel()
 
-        viewModelScope.launch {
+        val expectedTotalFrames = ceil(st.totalDurationSec * st.exportFps.coerceIn(10, 60)).toInt().coerceAtLeast(1)
+        exportJob = viewModelScope.launch {
             _uiState.update {
                 it.copy(
                     isExporting = true,
                     exportProgress = 0.02f,
                     exportStatusText = "Preparing hardware encoder...",
+                    exportFrameText = "Frame 0 / $expectedTotalFrames",
+                    exportEtaText = "Calculating...",
                     exportedVideoFile = null,
                     exportedVideoUri = null
                 )
@@ -1588,6 +1776,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     },
                     onProgress = { prog, msg ->
                         _uiState.update { it.copy(exportProgress = prog, exportStatusText = msg) }
+                    },
+                    onFrameProgress = { done, total, etaSec ->
+                        _uiState.update {
+                            it.copy(
+                                exportFrameText = "Frame $done / $total",
+                                exportEtaText = formatEtaText(etaSec)
+                            )
+                        }
                     }
                 )
                 _uiState.update {
@@ -1596,14 +1792,35 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                         exportProgress = 1f,
                         exportedVideoFile = res.file,
                         exportedVideoUri = res.shareUri,
+                        cachedRenderedMp4File = res.file,
+                        useVideoProxyPlayer = true,
+                        currentTimeSec = 0f,
+                        exportFrameText = "Complete ($expectedTotalFrames / $expectedTotalFrames)",
+                        exportEtaText = "0s left",
                         step3Done = true
                     )
                 }
                 appendLog("Hardware MP4 export finished: ${"%.1f".format(res.durationSec)}s, ${"%.2f".format(res.sizeBytes / (1024.0 * 1024.0))} MB")
-                showToast("Video exported with exact duration!")
+                showToast("Video exported! Ready for smooth playback & instant download.")
+            } catch (ce: CancellationException) {
+                _uiState.update {
+                    it.copy(
+                        isExporting = false,
+                        exportProgress = 0f,
+                        exportStatusText = "Export cancelled by user.",
+                        exportFrameText = "",
+                        exportEtaText = ""
+                    )
+                }
+                appendLog("Hardware MP4 export cancelled by user.")
             } catch (err: Throwable) {
                 _uiState.update {
-                    it.copy(isExporting = false, exportStatusText = "Export error: ${err.message}")
+                    it.copy(
+                        isExporting = false,
+                        exportStatusText = "Export error: ${err.message}",
+                        exportFrameText = "",
+                        exportEtaText = ""
+                    )
                 }
                 appendLog("Export error: ${err.message}")
                 showToast("Export failed: ${err.message}")
@@ -1613,17 +1830,41 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun cancelExport() {
+        exportJob?.cancel()
+        exportJob = null
+    }
+
     fun saveExportedToGallery() {
-        val file = _uiState.value.exportedVideoFile ?: return
+        val st = _uiState.value
+        val file = st.exportedVideoFile ?: st.cachedRenderedMp4File
+        if (file == null || !file.exists()) {
+            showToast("Export the full MP4 first before saving to Gallery.")
+            return
+        }
+        if (st.isFastDownloadSaving) return
         viewModelScope.launch {
-            val savedUri = services.videoExporter.saveToMoviesGallery(file, "editoraPRO_${System.currentTimeMillis()}.mp4")
-            if (savedUri != null) {
-                showToast("Saved to Movies/editoraPRO!")
-                appendLog("Exported video saved to MediaStore: $savedUri")
-            } else {
-                showToast("Could not save to gallery.")
+            _uiState.update { it.copy(isFastDownloadSaving = true) }
+            try {
+                val savedUri = services.videoExporter.saveToMoviesGallery(file, "editoraPRO_${System.currentTimeMillis()}.mp4")
+                if (savedUri != null) {
+                    showToast("Downloaded to Movies/editoraPRO!")
+                    appendLog("Exported video saved to MediaStore: $savedUri")
+                } else {
+                    showToast("Could not save to gallery.")
+                }
+            } finally {
+                _uiState.update { it.copy(isFastDownloadSaving = false) }
             }
         }
+    }
+
+    private fun formatEtaText(etaSec: Long): String {
+        if (etaSec < 0L) return "Calculating..."
+        if (etaSec == 0L) return "Finishing..."
+        val mins = etaSec / 60L
+        val secs = etaSec % 60L
+        return if (mins > 0L) "~${mins}m ${secs}s left" else "~${secs}s left"
     }
 
     // ---- Diagnostic Report ----
@@ -1751,7 +1992,10 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     override fun onCleared() {
         super.onCleared()
         activeStageJob?.cancel()
+        previewProxyJob?.cancel()
+        exportJob?.cancel()
         stopPlayback()
+        previewProxyRenderer.clearProxyFiles()
         services.release()
     }
 }
