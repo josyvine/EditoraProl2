@@ -10,10 +10,13 @@ import android.media.MediaMuxer
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.SystemClock
 import android.provider.MediaStore
+import android.view.Surface
 import androidx.core.content.FileProvider
 import com.vineyard.editoraPRO.app.data.model.PcmAudioBuffer
 import com.vineyard.editoraPRO.app.domain.media.BeatDetector
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
@@ -34,8 +37,8 @@ data class ExportResult(
 )
 
 /**
- * Deterministic frame-by-frame Hardware Video Encoder (H.264/AVC via YUV420Flexible Image)
- * and Hardware AAC Audio Encoder muxed via MediaMuxer into an exact-duration MP4.
+ * Deterministic frame-by-frame Hardware Video Encoder (H.264/AVC via GPU Surface input
+ * with automatic YUV420Flexible Image/I420 fallback) and Hardware AAC Audio Encoder muxed via MediaMuxer.
  */
 class VideoExporter(private val context: Context) {
 
@@ -48,7 +51,10 @@ class VideoExporter(private val context: Context) {
         filePrefix: String = "editora_export",
         bitrate: Int = 5_000_000,
         renderFrameAt: suspend (timeSec: Float) -> Bitmap,
-        onProgress: (progress: Float, statusText: String) -> Unit
+        onProgress: (progress: Float, statusText: String) -> Unit,
+        outputDir: File? = null,
+        preferSurfaceInput: Boolean = true,
+        onFrameProgress: ((frameIndex: Int, totalFrames: Int, etaSec: Long) -> Unit)? = null
     ): ExportResult = withContext(Dispatchers.Default) {
         val outW = (width and 1.inv()).coerceAtLeast(16)
         val outH = (height and 1.inv()).coerceAtLeast(16)
@@ -56,25 +62,62 @@ class VideoExporter(private val context: Context) {
         val safeDur = durationSec.coerceAtLeast(0.5f)
         val totalFrames = ceil(safeDur * safeFps).toInt().coerceAtLeast(1)
 
-        val exportsDir = File(context.filesDir, "exports").apply { mkdirs() }
-        val outFile = File(exportsDir, "${filePrefix}_${System.currentTimeMillis()}.mp4")
+        val targetDir = (outputDir ?: File(context.filesDir, "exports")).apply { mkdirs() }
+        val outFile = File(targetDir, "${filePrefix}_${System.currentTimeMillis()}.mp4")
         if (outFile.exists()) outFile.delete()
 
         val wantAudio = audioBuffer != null && audioBuffer.samples.isNotEmpty()
         var videoEncoder: MediaCodec? = null
         var audioEncoder: MediaCodec? = null
+        var inputSurface: Surface? = null
+        var surfaceBridge: GlSurfaceEncoderBridge? = null
         var muxer: MediaMuxer? = null
 
         try {
-            val vFmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, outW, outH).apply {
-                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
-                setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-                setInteger(MediaFormat.KEY_FRAME_RATE, safeFps)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            if (preferSurfaceInput) {
+                val surfaceAttempt = runCatching {
+                    val sFmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, outW, outH).apply {
+                        setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                        setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                        setInteger(MediaFormat.KEY_FRAME_RATE, safeFps)
+                        setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+                    }
+                    val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
+                        configure(sFmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                    }
+                    val surf = enc.createInputSurface()
+                    enc.start()
+                    val bridge = GlSurfaceEncoderBridge(outW, outH)
+                    bridge.prepare(surf)
+                    Triple(enc, surf, bridge)
+                }
+                if (surfaceAttempt.isSuccess) {
+                    val (enc, surf, bridge) = surfaceAttempt.getOrThrow()
+                    videoEncoder = enc
+                    inputSurface = surf
+                    surfaceBridge = bridge
+                } else {
+                    runCatching { surfaceAttempt.exceptionOrNull() }
+                    runCatching { surfaceBridge?.release() }
+                    runCatching { videoEncoder?.stop(); videoEncoder?.release() }
+                    runCatching { inputSurface?.release() }
+                    surfaceBridge = null
+                    videoEncoder = null
+                    inputSurface = null
+                }
             }
-            videoEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
-                configure(vFmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                start()
+
+            if (videoEncoder == null) {
+                val vFmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, outW, outH).apply {
+                    setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+                    setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                    setInteger(MediaFormat.KEY_FRAME_RATE, safeFps)
+                    setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+                }
+                videoEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
+                    configure(vFmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                    start()
+                }
             }
 
             if (wantAudio) {
@@ -236,6 +279,7 @@ class VideoExporter(private val context: Context) {
 
                 // Signal audio EOS
                 while (true) {
+                    coroutineContext.ensureActive()
                     val inIdx = audioEncoder.dequeueInputBuffer(10_000)
                     if (inIdx >= 0) {
                         val ptsUs = (framesEncoded * 1_000_000L) / 48_000L
@@ -251,59 +295,85 @@ class VideoExporter(private val context: Context) {
                 }
             }
 
-            val argbPixels = IntArray(outW * outH)
+            // Update status immediately BEFORE frame 0 blocks on heavy frame rendering
+            onProgress(0.05f, "Rendering frame 1/$totalFrames (0.0s / ${"%.1f".format(safeDur)}s)...")
+            onFrameProgress?.invoke(0, totalFrames, -1L)
+
+            val loopStartMs = SystemClock.elapsedRealtime()
+            val argbPixels = if (surfaceBridge == null) IntArray(outW * outH) else null
+
             for (f in 0 until totalFrames) {
                 coroutineContext.ensureActive()
                 val t = min(safeDur - 0.001f, f.toFloat() / safeFps.toFloat())
                 val rawBmp = renderFrameAt(t)
-                val frameBmp = if (rawBmp.width != outW || rawBmp.height != outH) {
-                    Bitmap.createScaledBitmap(rawBmp, outW, outH, true)
-                } else {
-                    rawBmp
-                }
-                frameBmp.getPixels(argbPixels, 0, outW, 0, 0, outW, outH)
-                if (frameBmp !== rawBmp) frameBmp.recycle()
+                coroutineContext.ensureActive()
 
-                var submitted = false
-                while (!submitted) {
-                    coroutineContext.ensureActive()
-                    val inIdx = videoEncoder.dequeueInputBuffer(10_000)
-                    if (inIdx >= 0) {
-                        val ptsUs = (f.toLong() * 1_000_000L) / safeFps.toLong()
-                        val inputImage = runCatching { videoEncoder.getInputImage(inIdx) }.getOrNull()
-                        val bytesWritten = if (inputImage != null) {
-                            writeArgbToYuvImage(argbPixels, outW, outH, inputImage)
-                            outW * outH * 3 / 2
-                        } else {
-                            val buf = videoEncoder.getInputBuffer(inIdx)!!
-                            writeArgbToI420Buffer(argbPixels, outW, outH, buf)
-                        }
-                        videoEncoder.queueInputBuffer(inIdx, 0, bytesWritten, ptsUs, 0)
-                        submitted = true
-                    }
+                val ptsUs = (f.toLong() * 1_000_000L) / safeFps.toLong()
+
+                if (surfaceBridge != null) {
+                    surfaceBridge.encodeFrame(rawBmp, ptsUs)
                     drainVideo(endOfStream = false)
+                } else {
+                    val pixels = argbPixels!!
+                    val frameBmp = if (rawBmp.width != outW || rawBmp.height != outH) {
+                        Bitmap.createScaledBitmap(rawBmp, outW, outH, true)
+                    } else {
+                        rawBmp
+                    }
+                    frameBmp.getPixels(pixels, 0, outW, 0, 0, outW, outH)
+                    if (frameBmp !== rawBmp) frameBmp.recycle()
+
+                    var submitted = false
+                    while (!submitted) {
+                        coroutineContext.ensureActive()
+                        val inIdx = videoEncoder.dequeueInputBuffer(10_000)
+                        if (inIdx >= 0) {
+                            val inputImage = runCatching { videoEncoder.getInputImage(inIdx) }.getOrNull()
+                            val bytesWritten = if (inputImage != null) {
+                                writeArgbToYuvImage(pixels, outW, outH, inputImage)
+                                outW * outH * 3 / 2
+                            } else {
+                                val buf = videoEncoder.getInputBuffer(inIdx)!!
+                                writeArgbToI420Buffer(pixels, outW, outH, buf)
+                            }
+                            videoEncoder.queueInputBuffer(inIdx, 0, bytesWritten, ptsUs, 0)
+                            submitted = true
+                        }
+                        drainVideo(endOfStream = false)
+                    }
                 }
 
-                val pct = 0.08f + ((f + 1).toFloat() / totalFrames.toFloat()) * 0.88f
+                val done = f + 1
+                val elapsedMs = (SystemClock.elapsedRealtime() - loopStartMs).coerceAtLeast(1L)
+                val avgMs = elapsedMs.toDouble() / done.toDouble()
+                val etaSec = ((totalFrames - done) * avgMs / 1000.0).roundToInt().toLong().coerceAtLeast(0L)
+                onFrameProgress?.invoke(done, totalFrames, etaSec)
+
+                val pct = 0.08f + (done.toFloat() / totalFrames.toFloat()) * 0.88f
                 onProgress(
                     pct.coerceIn(0.08f, 0.96f),
-                    "Encoding frame ${f + 1}/$totalFrames (${"%.1f".format(t)}s / ${"%.1f".format(safeDur)}s)"
+                    "Encoding frame $done/$totalFrames (${"%.1f".format(t)}s / ${"%.1f".format(safeDur)}s)"
                 )
             }
 
             // Signal video EOS
-            while (true) {
-                val inIdx = videoEncoder.dequeueInputBuffer(10_000)
-                if (inIdx >= 0) {
-                    val ptsUs = (totalFrames.toLong() * 1_000_000L) / safeFps.toLong()
-                    videoEncoder.queueInputBuffer(inIdx, 0, 0, ptsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                    break
+            if (surfaceBridge != null) {
+                videoEncoder.signalEndOfInputStream()
+            } else {
+                while (true) {
+                    coroutineContext.ensureActive()
+                    val inIdx = videoEncoder.dequeueInputBuffer(10_000)
+                    if (inIdx >= 0) {
+                        val ptsUs = (totalFrames.toLong() * 1_000_000L) / safeFps.toLong()
+                        videoEncoder.queueInputBuffer(inIdx, 0, 0, ptsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        break
+                    }
+                    drainVideo(endOfStream = false)
                 }
-                drainVideo(endOfStream = false)
             }
             var videoEos = false
             var vSpin = 0
-            while (!videoEos && vSpin++ < 200) {
+            while (!videoEos && vSpin++ < 500) {
                 videoEos = drainVideo(endOfStream = true)
             }
 
@@ -312,17 +382,28 @@ class VideoExporter(private val context: Context) {
             if (muxerStarted) {
                 muxer.stop()
             }
+        } catch (ce: CancellationException) {
+            runCatching { if (outFile.exists()) outFile.delete() }
+            throw ce
+        } catch (t: Throwable) {
+            runCatching { if (outFile.exists()) outFile.delete() }
+            throw t
         } finally {
+            runCatching { surfaceBridge?.release() }
             runCatching { videoEncoder?.stop(); videoEncoder?.release() }
+            runCatching { inputSurface?.release() }
             runCatching { audioEncoder?.stop(); audioEncoder?.release() }
             runCatching { muxer?.release() }
         }
 
-        val shareUri = FileProvider.getUriForFile(
-            context,
-            "${context.packageName}.fileprovider",
-            outFile
-        )
+        val shareUri = runCatching {
+            FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                outFile
+            )
+        }.getOrElse { Uri.fromFile(outFile) }
+
         onProgress(
             1f,
             "Exported exact ${"%.1f".format(safeDur)}s • ${"%.2f".format(outFile.length() / (1024.0 * 1024.0))} MB (.mp4)"
