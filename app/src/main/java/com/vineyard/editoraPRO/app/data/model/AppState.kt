@@ -93,6 +93,17 @@ data class AppState(
     val exportedVideoFile: File? = null,
     val exportedVideoUri: Uri? = null,
 
+    // Smooth Preview Proxy & Instant Cached Download State
+    val previewProxyFile: File? = null,
+    val isBuildingPreviewProxy: Boolean = false,
+    val previewProxyProgress: Float = 0f,
+    val previewProxyStatusText: String = "",
+    val useVideoProxyPlayer: Boolean = true,
+    val exportFrameText: String = "",
+    val exportEtaText: String = "",
+    val cachedRenderedMp4File: File? = null,
+    val isFastDownloadSaving: Boolean = false,
+
     // AI Logic Inspector
     val streamMonitorStatus: ProcessStatus = ProcessStatus.IDLE,
     val liveStreamText: String = "Waiting for AI request...",
