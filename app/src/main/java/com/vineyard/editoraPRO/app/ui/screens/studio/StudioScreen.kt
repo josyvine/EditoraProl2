@@ -75,6 +75,12 @@ fun StudioScreen(
     onExternalScriptChanged: (String) -> Unit = {},
     onRunExternalScript: (String) -> Unit = {},
     onShowToast: (String) -> Unit = {},
+    onBuildPreviewProxy: () -> Unit = {},
+    onCancelPreviewProxy: () -> Unit = {},
+    onCancelExport: () -> Unit = {},
+    onToggleUseProxyPlayer: (Boolean) -> Unit = {},
+    onExoPositionChanged: (Float) -> Unit = {},
+    onExoPlayingChanged: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -132,7 +138,13 @@ fun StudioScreen(
                 onExportVideo = onExportVideo,
                 onSaveToGallery = onSaveToGallery,
                 onPreviousStep = { onSelectWizardStep(2) },
-                onNavigateToSettings = onNavigateToSettings
+                onNavigateToSettings = onNavigateToSettings,
+                onBuildPreviewProxy = onBuildPreviewProxy,
+                onCancelPreviewProxy = onCancelPreviewProxy,
+                onCancelExport = onCancelExport,
+                onToggleUseProxyPlayer = onToggleUseProxyPlayer,
+                onExoPositionChanged = onExoPositionChanged,
+                onExoPlayingChanged = onExoPlayingChanged
             )
         }
     }
