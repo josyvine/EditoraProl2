@@ -7,6 +7,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.Rect
 import android.os.SystemClock
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.ByteBufferExtractor
@@ -68,10 +69,18 @@ class SmartSegmenter(
     private var samEncoderSession: OrtSession? = null
     private var samDecoderSession: OrtSession? = null
 
-    // Embedding cache for EdgeSAM so multiple prompts on the same frame reuse [1, 256, 64, 64]
-    private var lastEmbeddingHash: Int = 0
-    private var lastEmbeddingData: FloatArray? = null
-    private var lastEmbeddingShape: LongArray? = null
+    // Multi-frame LRU cache for detections, EdgeSAM embeddings, and final masks
+    private val maskCache = MaskCacheManager()
+
+    // Pre-allocated reusable 1024x1024 EdgeSAM buffers (protected by inferMutex)
+    private var samScaled1024Bmp: Bitmap? = null
+    private var samScaled1024Canvas: Canvas? = null
+    private var samPixels1024: IntArray? = null
+    private var samTensorData1024: FloatArray? = null
+    private var samEmptyMaskInput: FloatArray? = null
+    private val samScalePaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val samSrcRect = Rect()
+    private val samDstRect1024 = Rect(0, 0, 1024, 1024)
 
     private fun assetExists(name: String): Boolean = runCatching {
         appContext.assets.open(name).use { true }
@@ -170,15 +179,22 @@ class SmartSegmenter(
     }
 
     private fun createOrtSession(env: OrtEnvironment, modelFile: File): OrtSession? {
+        val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
         return runCatching {
             val opts = OrtSession.SessionOptions().apply {
                 setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                setIntraOpNumThreads(threads)
+                setInterOpNumThreads(1)
                 runCatching { addNnapi() }
             }
             env.createSession(modelFile.absolutePath, opts)
         }.getOrElse {
             runCatching {
-                val cpuOpts = OrtSession.SessionOptions()
+                val cpuOpts = OrtSession.SessionOptions().apply {
+                    setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                    setIntraOpNumThreads(threads)
+                    setInterOpNumThreads(1)
+                }
                 env.createSession(modelFile.absolutePath, cpuOpts)
             }.getOrNull()
         }
@@ -251,12 +267,22 @@ class SmartSegmenter(
                 onLog("Tier 1 MediaPipe skipped: invalid or recycled source bitmap.")
                 return@withContext MaskResult(w, h, FloatArray(w * h))
             }
+
+            val srcHash = computeBitmapHash(source)
+            maskCache.getMediaPipeMask(srcHash, w, h)?.let { cached ->
+                return@withContext cached
+            }
+
             ensureTier1Ready()
             inferMutex.withLock {
                 if (source.isRecycled || source.width <= 0 || source.height <= 0) {
                     onLog("Tier 1 MediaPipe skipped: source bitmap recycled before inference.")
                     return@withLock MaskResult(w, h, FloatArray(w * h))
                 }
+                maskCache.getMediaPipeMask(srcHash, w, h)?.let { cached ->
+                    return@withLock cached
+                }
+
                 val startMs = SystemClock.elapsedRealtime()
                 val scaledIn = if (source.width != w || source.height != h) {
                     createCoverBitmap(source, w, h)
@@ -314,13 +340,17 @@ class SmartSegmenter(
                 }
 
                 val elapsed = SystemClock.elapsedRealtime() - startMs
-                if (!anyMask) {
+                val result = if (!anyMask) {
                     fused.fill(0f)
                     onLog("Tier 1 MediaPipe failed (${w}x${h}): no segmentation model loaded/active (${elapsed}ms)")
+                    MaskResult(w, h, fused)
                 } else {
                     onLog("Tier 1 MediaPipe dual fusion (${w}x${h}) completed in ${elapsed}ms")
+                    MaskResult(w, h, fused).also {
+                        maskCache.putMediaPipeMask(srcHash, it)
+                    }
                 }
-                MaskResult(w, h, fused)
+                result
             }
         }
 
@@ -331,11 +361,16 @@ class SmartSegmenter(
         if (source.isRecycled || source.width <= 0 || source.height <= 0) {
             return@withContext emptyList()
         }
+        val srcHash = computeBitmapHash(source)
+        maskCache.getBoxes(srcHash)?.let { return@withContext it }
+
         ensureDetectorReady()
         inferMutex.withLock {
             if (source.isRecycled || source.width <= 0 || source.height <= 0) {
                 return@withLock emptyList()
             }
+            maskCache.getBoxes(srcHash)?.let { return@withLock it }
+
             val detector = objectDetector ?: return@withLock emptyList()
             val detInput = source.copy(Bitmap.Config.ARGB_8888, false)
                 ?: return@withLock emptyList()
@@ -344,7 +379,7 @@ class SmartSegmenter(
                 val result = detector.detect(mpImage)
                 val imgW = detInput.width.coerceAtLeast(1).toFloat()
                 val imgH = detInput.height.coerceAtLeast(1).toFloat()
-                result.detections().mapNotNull { det ->
+                val boxes = result.detections().mapNotNull { det ->
                     val cat = det.categories().firstOrNull() ?: return@mapNotNull null
                     val box = det.boundingBox()
                     val nx = (box.left / imgW).coerceIn(0f, 1f)
@@ -357,6 +392,8 @@ class SmartSegmenter(
                         box = listOf(nx, ny, nw, nh)
                     )
                 }
+                maskCache.putBoxes(srcHash, boxes)
+                boxes
             } finally {
                 mpImage.close()
                 if (!detInput.isRecycled) detInput.recycle()
@@ -416,11 +453,21 @@ class SmartSegmenter(
                 return@withContext MaskResult(w, h, FloatArray(w * h))
             }
 
+            val frameHash = computeBitmapHash(workBmp)
+            val promptSig = buildPromptSignature(resolvedPrompts)
+            maskCache.getSamMask(frameHash, w, h, promptSig)?.let { cachedMask ->
+                return@withContext cachedMask
+            }
+
             inferMutex.withLock {
                 if (workBmp.isRecycled || workBmp.width <= 0 || workBmp.height <= 0) {
                     onLog("Tier 2 EdgeSAM skipped: source bitmap recycled before inference.")
                     return@withLock MaskResult(w, h, FloatArray(w * h))
                 }
+                maskCache.getSamMask(frameHash, w, h, promptSig)?.let { cachedMask ->
+                    return@withLock cachedMask
+                }
+
                 val env = ortEnv
                 val enc = samEncoderSession
                 val dec = samDecoderSession
@@ -429,30 +476,40 @@ class SmartSegmenter(
                     return@withLock MaskResult(w, h, FloatArray(w * h))
                 }
 
-                // 1. Run or reuse 1024x1024 EdgeSAM encoder embedding
-                val frameHash = computeBitmapHash(workBmp)
+                // 1. Run or reuse 1024x1024 EdgeSAM encoder embedding from multi-frame cache
                 val embData: FloatArray
                 val embShape: LongArray
+                val cachedEmb = maskCache.getEmbedding(frameHash)
 
-                if (frameHash == lastEmbeddingHash && lastEmbeddingData != null && lastEmbeddingShape != null) {
-                    embData = lastEmbeddingData!!
-                    embShape = lastEmbeddingShape!!
+                if (cachedEmb != null) {
+                    embData = cachedEmb.data
+                    embShape = cachedEmb.shape
                 } else {
-                    val input1024 = Bitmap.createScaledBitmap(workBmp, 1024, 1024, true)
-                    val pixels = IntArray(1024 * 1024)
-                    input1024.getPixels(pixels, 0, 1024, 0, 0, 1024, 1024)
-                    if (input1024 !== workBmp) input1024.recycle()
+                    val bmp1024 = samScaled1024Bmp?.takeIf { !it.isRecycled }
+                        ?: Bitmap.createBitmap(1024, 1024, Bitmap.Config.ARGB_8888).also {
+                            samScaled1024Bmp = it
+                            samScaled1024Canvas = Canvas(it)
+                        }
+                    val canvas1024 = samScaled1024Canvas ?: Canvas(bmp1024).also { samScaled1024Canvas = it }
+                    samSrcRect.set(0, 0, workBmp.width, workBmp.height)
+                    canvas1024.drawBitmap(workBmp, samSrcRect, samDstRect1024, samScalePaint)
 
-                    val tensorData = FloatArray(3 * 1024 * 1024)
                     val plane = 1024 * 1024
+                    val pixels = samPixels1024 ?: IntArray(plane).also { samPixels1024 = it }
+                    bmp1024.getPixels(pixels, 0, 1024, 0, 0, 1024, 1024)
+
+                    val tensorData = samTensorData1024 ?: FloatArray(3 * plane).also { samTensorData1024 = it }
+                    val invR = 1f / 58.395f
+                    val invG = 1f / 57.12f
+                    val invB = 1f / 57.375f
                     for (i in 0 until plane) {
                         val px = pixels[i]
                         val r = ((px shr 16) and 0xFF).toFloat()
                         val g = ((px shr 8) and 0xFF).toFloat()
                         val b = (px and 0xFF).toFloat()
-                        tensorData[i] = (r - 123.675f) / 58.395f
-                        tensorData[plane + i] = (g - 116.28f) / 57.12f
-                        tensorData[2 * plane + i] = (b - 103.53f) / 57.375f
+                        tensorData[i] = (r - 123.675f) * invR
+                        tensorData[plane + i] = (g - 116.28f) * invG
+                        tensorData[2 * plane + i] = (b - 103.53f) * invB
                     }
 
                     val encInputName = enc.inputNames.first()
@@ -463,9 +520,7 @@ class SmartSegmenter(
                             val fb = outTensor.floatBuffer
                             embData = FloatArray(fb.remaining())
                             fb.get(embData)
-                            lastEmbeddingHash = frameHash
-                            lastEmbeddingData = embData
-                            lastEmbeddingShape = embShape
+                            maskCache.putEmbedding(frameHash, embData, embShape)
                         }
                     }
                 }
@@ -496,6 +551,7 @@ class SmartSegmenter(
                 val numPts = labelsList.size.coerceAtLeast(1)
                 val coordsArr = coordsList.toFloatArray()
                 val labelsArr = labelsList.toFloatArray()
+                val emptyMaskArr = samEmptyMaskInput ?: FloatArray(256 * 256).also { samEmptyMaskInput = it }
 
                 val decInputs = mutableMapOf<String, OnnxTensor>()
                 val createdTensors = mutableListOf<OnnxTensor>()
@@ -505,7 +561,7 @@ class SmartSegmenter(
                             "image_embeddings" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(embData), embShape)
                             "point_coords" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(coordsArr), longArrayOf(1, numPts.toLong(), 2))
                             "point_labels" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(labelsArr), longArrayOf(1, numPts.toLong()))
-                            "mask_input" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(FloatArray(256 * 256)), longArrayOf(1, 1, 256, 256))
+                            "mask_input" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(emptyMaskArr), longArrayOf(1, 1, 256, 256))
                             "has_mask_input" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(floatArrayOf(0f)), longArrayOf(1))
                             "orig_im_size" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(floatArrayOf(h.toFloat(), w.toFloat())), longArrayOf(2))
                             else -> null
@@ -553,14 +609,16 @@ class SmartSegmenter(
                         }
 
                         val resized = resizeMaskBilinear(rawMask, mw, mh, w, h)
-                        MaskResult(w, h, resized)
+                        MaskResult(w, h, resized).also {
+                            maskCache.putSamMask(frameHash, promptSig, it)
+                        }
                     }
                 } finally {
                     createdTensors.forEach { runCatching { it.close() } }
                 }
             }
         } finally {
-            if (workBmp !== source) workBmp.recycle()
+            if (workBmp !== source && !workBmp.isRecycled) workBmp.recycle()
         }
     }
 
@@ -741,6 +799,21 @@ class SmartSegmenter(
         return out
     }
 
+    private fun buildPromptSignature(opts: SamPromptOptions): Int {
+        var h = 17
+        for (box in opts.boxes) {
+            for (v in box) {
+                h = h * 31 + (v * 1000f).roundToInt()
+            }
+        }
+        for (pt in opts.points) {
+            h = h * 31 + (pt.x * 1000f).roundToInt()
+            h = h * 31 + (pt.y * 1000f).roundToInt()
+            h = h * 31 + pt.label
+        }
+        return h
+    }
+
     private fun computeBitmapHash(bmp: Bitmap): Int {
         val sample = Bitmap.createScaledBitmap(bmp, 16, 16, false)
         val px = IntArray(256)
@@ -751,17 +824,30 @@ class SmartSegmenter(
         return h
     }
 
+    fun clearCaches() {
+        maskCache.clear()
+    }
+
     fun release() {
         runCatching { deepLabSegmenter?.close() }
         runCatching { multiclassSegmenter?.close() }
         runCatching { objectDetector?.close() }
         runCatching { samEncoderSession?.close() }
         runCatching { samDecoderSession?.close() }
+        runCatching {
+            if (samScaled1024Bmp?.isRecycled == false) samScaled1024Bmp?.recycle()
+        }
         deepLabSegmenter = null
         multiclassSegmenter = null
         objectDetector = null
         samEncoderSession = null
         samDecoderSession = null
+        samScaled1024Bmp = null
+        samScaled1024Canvas = null
+        samPixels1024 = null
+        samTensorData1024 = null
+        samEmptyMaskInput = null
+        maskCache.clear()
     }
 
     companion object {
