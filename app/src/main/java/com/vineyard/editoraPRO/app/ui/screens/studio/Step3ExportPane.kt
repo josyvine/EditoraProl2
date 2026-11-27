@@ -1,6 +1,7 @@
 package com.vineyard.editoraPRO.app.ui.screens.studio
 
 import android.content.Intent
+import android.net.Uri
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
@@ -62,13 +63,32 @@ fun Step3ExportPane(
     onSaveToGallery: () -> Unit,
     onPreviousStep: () -> Unit,
     onNavigateToSettings: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onBuildPreviewProxy: () -> Unit = {},
+    onCancelPreviewProxy: () -> Unit = {},
+    onCancelExport: () -> Unit = {},
+    onToggleUseProxyPlayer: (Boolean) -> Unit = {},
+    onExoPositionChanged: (Float) -> Unit = {},
+    onExoPlayingChanged: (Boolean) -> Unit = {}
 ) {
     val context = LocalContext.current
     val isQaRunning = state.stage3Monitor.status == ProcessStatus.RUNNING
+    val isHeavyJobBusy = state.isExporting || state.isBuildingPreviewProxy
 
     val ratio = (state.canvasWidth.toFloat() / state.canvasHeight.coerceAtLeast(1).toFloat())
         .coerceIn(0.45f, 2.2f)
+    val stageHeight = when {
+        ratio < 0.85f -> 290.dp
+        ratio > 1.25f -> 195.dp
+        else -> 240.dp
+    }
+
+    val playableFile = if (state.useVideoProxyPlayer) {
+        (state.exportedVideoFile ?: state.cachedRenderedMp4File ?: state.previewProxyFile)
+            ?.takeIf { it.exists() && it.length() > 1024L }
+    } else {
+        null
+    }
 
     Column(
         modifier = modifier.fillMaxWidth(),
@@ -78,52 +98,71 @@ fun Step3ExportPane(
             CardStepHeader(
                 stepNumber = "3",
                 title = "AI Render Output",
-                pillText = if (state.isRenderReady) "${state.canvasWidth}x${state.canvasHeight} Ready" else "Waiting",
+                pillText = when {
+                    !state.isRenderReady -> "Waiting"
+                    playableFile != null -> "${state.canvasWidth}x${state.canvasHeight} • Smooth MP4"
+                    else -> "${state.canvasWidth}x${state.canvasHeight} Ready"
+                },
                 pillTone = if (state.isRenderReady) PillTone.READY else PillTone.NEUTRAL,
                 pillTag = "render_badge"
             )
 
-            // Composite Frame Canvas Stage
+            // Composite Frame Canvas Stage (switches automatically to ExoPlayer when MP4 is cached!)
             Column(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Box(
-                    modifier = Modifier
-                        .heightIn(min = 160.dp, max = 300.dp)
-                        .aspectRatio(ratio)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Color.Black)
-                        .border(1.dp, EditoraBorder, RoundedCornerShape(12.dp))
-                        .testTag("render_preview_stage"),
-                    contentAlignment = Alignment.Center
-                ) {
-                    val bmp = state.previewFrame
-                    if (bmp != null) {
-                        Image(
-                            bitmap = bmp.asImageBitmap(),
-                            contentDescription = "AI Rendered Output Frame",
-                            contentScale = ContentScale.Fit,
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    } else {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
-                            modifier = Modifier.padding(16.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.Movie,
-                                contentDescription = "Preview Placeholder",
-                                tint = EditoraTextMuted,
-                                modifier = Modifier.size(30.dp)
+                if (playableFile != null) {
+                    ExoVideoPreview(
+                        uri = Uri.fromFile(playableFile),
+                        testTag = "render_preview_stage",
+                        height = stageHeight,
+                        modifier = Modifier.aspectRatio(ratio),
+                        externalIsPlaying = state.isPlaying,
+                        externalSeekSec = state.currentTimeSec,
+                        loopPlayback = false,
+                        useBuiltInController = false,
+                        onPositionChanged = onExoPositionChanged,
+                        onPlayingChanged = onExoPlayingChanged
+                    )
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .heightIn(min = 160.dp, max = 300.dp)
+                            .aspectRatio(ratio)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color.Black)
+                            .border(1.dp, EditoraBorder, RoundedCornerShape(12.dp))
+                            .testTag("render_preview_stage"),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        val bmp = state.previewFrame
+                        if (bmp != null) {
+                            Image(
+                                bitmap = bmp.asImageBitmap(),
+                                contentDescription = "AI Rendered Output Frame",
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier.fillMaxSize()
                             )
-                            Text(
-                                text = "Generate an edit in Step 2 to preview",
-                                color = EditoraTextMuted,
-                                fontSize = 11.sp
-                            )
+                        } else {
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier.padding(16.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.Movie,
+                                    contentDescription = "Preview Placeholder",
+                                    tint = EditoraTextMuted,
+                                    modifier = Modifier.size(30.dp)
+                                )
+                                Text(
+                                    text = "Generate an edit in Step 2 to preview",
+                                    color = EditoraTextMuted,
+                                    fontSize = 11.sp
+                                )
+                            }
                         }
                     }
                 }
@@ -131,7 +170,7 @@ fun Step3ExportPane(
                 VideoScrubber(
                     currentTimeSec = state.currentTimeSec,
                     totalDurationSec = state.totalDurationSec,
-                    enabled = state.isRenderReady,
+                    enabled = state.isRenderReady && (playableFile != null || !isHeavyJobBusy),
                     onSeek = onSeek
                 )
             }
@@ -144,7 +183,7 @@ fun Step3ExportPane(
                     text = if (state.isPlaying) "Pause Preview" else "Play Preview",
                     onClick = onTogglePlayPause,
                     tone = EditoraButtonTone.SECONDARY,
-                    enabled = state.isRenderReady,
+                    enabled = state.isRenderReady && (playableFile != null || !isHeavyJobBusy),
                     testTag = "play_pause_button",
                     modifier = Modifier.weight(1f)
                 )
@@ -152,10 +191,90 @@ fun Step3ExportPane(
                     text = if (state.isExporting) "Exporting..." else "Export Video",
                     onClick = onExportVideo,
                     tone = EditoraButtonTone.SUCCESS,
-                    enabled = state.isRenderReady && !state.isExporting,
+                    enabled = state.isRenderReady && !isHeavyJobBusy,
                     testTag = "export_video_button",
                     modifier = Modifier.weight(1f)
                 )
+                if (state.isExporting) {
+                    EditoraButton(
+                        text = "Stop",
+                        onClick = onCancelExport,
+                        tone = EditoraButtonTone.DANGER,
+                        testTag = "cancel_export_button"
+                    )
+                }
+            }
+
+            // Smooth Playable Preview Proxy Builder / Player Switcher
+            AnimatedVisibility(visible = state.isRenderReady) {
+                val hasAnyCachedMp4 = (state.exportedVideoFile ?: state.cachedRenderedMp4File ?: state.previewProxyFile)
+                    ?.let { it.exists() && it.length() > 1024L } == true
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    if (state.isBuildingPreviewProxy) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = state.previewProxyStatusText.ifBlank { "Building smooth preview..." },
+                                color = EditoraTextMuted,
+                                fontSize = 11.sp,
+                                modifier = Modifier.weight(1f)
+                            )
+                            EditoraButton(
+                                text = "Stop",
+                                onClick = onCancelPreviewProxy,
+                                tone = EditoraButtonTone.DANGER,
+                                testTag = "cancel_proxy_button"
+                            )
+                        }
+                        if (state.exportFrameText.isNotBlank() || state.exportEtaText.isNotBlank()) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = state.exportFrameText,
+                                    color = EditoraTextMuted,
+                                    fontSize = 11.sp
+                                )
+                                Text(
+                                    text = state.exportEtaText,
+                                    color = EditoraTextMuted,
+                                    fontSize = 11.sp
+                                )
+                            }
+                        }
+                        ShimmerProgressTrack(
+                            progress = state.previewProxyProgress,
+                            isActive = true
+                        )
+                    } else if (!hasAnyCachedMp4 && !state.isExporting) {
+                        EditoraButton(
+                            text = "Build Smooth Preview (Fast 15fps MP4)",
+                            onClick = onBuildPreviewProxy,
+                            tone = EditoraButtonTone.SECONDARY,
+                            testTag = "build_preview_proxy_button",
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    } else if (hasAnyCachedMp4 && !state.isExporting) {
+                        EditoraButton(
+                            text = if (state.useVideoProxyPlayer) {
+                                "Player Mode: Smooth MP4 (Tap for Frame Scrub)"
+                            } else {
+                                "Player Mode: Frame Scrub (Tap for Smooth MP4)"
+                            },
+                            onClick = { onToggleUseProxyPlayer(!state.useVideoProxyPlayer) },
+                            tone = EditoraButtonTone.SECONDARY,
+                            testTag = "toggle_player_mode_button",
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
             }
 
             // On-Demand Visual QA / Auto-Fix Box
@@ -187,7 +306,7 @@ fun Step3ExportPane(
                             text = "AI Auto-Fix",
                             onClick = onRunManualAutoFix,
                             tone = EditoraButtonTone.WARN,
-                            enabled = state.isRenderReady && !isQaRunning,
+                            enabled = state.isRenderReady && !isQaRunning && !isHeavyJobBusy,
                             testTag = "fix_render_button"
                         )
                         if (isQaRunning) {
@@ -219,6 +338,25 @@ fun Step3ExportPane(
                         fontSize = 12.sp,
                         modifier = Modifier.testTag("export_status_text")
                     )
+                    if (state.exportFrameText.isNotBlank() || state.exportEtaText.isNotBlank()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = state.exportFrameText,
+                                color = EditoraTextMuted,
+                                fontSize = 11.sp,
+                                modifier = Modifier.testTag("export_frame_text")
+                            )
+                            Text(
+                                text = state.exportEtaText,
+                                color = EditoraTextMuted,
+                                fontSize = 11.sp,
+                                modifier = Modifier.testTag("export_eta_text")
+                            )
+                        }
+                    }
                     ShimmerProgressTrack(
                         progress = state.exportProgress,
                         isActive = true
@@ -226,8 +364,9 @@ fun Step3ExportPane(
                 }
             }
 
-            AnimatedVisibility(visible = state.exportedVideoUri != null) {
-                val outUri = state.exportedVideoUri
+            val cachedExportFile = state.exportedVideoFile ?: state.cachedRenderedMp4File
+            val outUri = state.exportedVideoUri ?: cachedExportFile?.let { Uri.fromFile(it) }
+            AnimatedVisibility(visible = outUri != null) {
                 if (outUri != null) {
                     Column(
                         modifier = Modifier
@@ -245,9 +384,10 @@ fun Step3ExportPane(
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             EditoraButton(
-                                text = "Save to Movies",
+                                text = if (state.isFastDownloadSaving) "Saving..." else "Download / Save MP4",
                                 onClick = onSaveToGallery,
                                 tone = EditoraButtonTone.SUCCESS,
+                                enabled = !state.isFastDownloadSaving,
                                 testTag = "save_movies_button",
                                 modifier = Modifier.weight(1f)
                             )
